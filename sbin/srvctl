@@ -1,0 +1,267 @@
+#!/bin/bash
+
+APP=ckproxy
+ROOT_DIR=/home/s/safe/skylarproxy
+PID_PATH=/home/s/safe/skylarproxy/conf
+PID=${PID_PATH}/app.pid
+
+function status() {
+    num=`ps -ef|grep -v grep|grep -v srvctl|grep $APP|wc -l`
+    if [ $num -eq 0 ]
+    then
+        echo $APP is not running
+        rm -rf $PID
+
+        check_port_use http
+        ret=$?
+        if [ $ret -eq 1 ];then
+            exit 1
+        fi
+
+        check_port_use udp
+        ret=$?
+        if [ $ret -eq 1 ];then
+            exit 1
+        fi
+    else
+        echo $APP is running
+        exit 0
+    fi
+}
+
+function check_port_use() {
+    type=$1
+    if [ $type == "http" ];then
+        type=tcp
+    fi
+    port_str=${1}_port
+    port=`cat /home/s/safe/skylarproxy/conf/app.conf |grep $port_str|awk -F'=' '{print $2}'| awk '{print $1}'`
+
+    ret_str=`lsof -i:$port`
+    ret=$?
+    if [ $ret -eq 0 ];then
+        echo "[ERROR] $type port $port is used, please check!"
+        echo "[ERROR]" $ret_str
+        return 1
+    fi
+    return 0
+}
+
+function add_white_port_el6() {
+    port=$1
+    type=$2
+    service  iptables  status
+    ret=$?
+    echo $ret
+    if [ $ret != 0 ];then
+        echo "iptables not running,skipped"
+        return
+    fi
+    service  iptables  status|grep ACCEPT|grep $type|grep $port
+    if [ $? == 0 ];then
+        echo $port has be allowed,skipped
+        return
+    fi
+    iptables -I INPUT 1 -p $type -m $type --dport $port -j ACCEPT
+    echo $?
+    if [ $? == 0 ];
+    then
+        echo $port is allowed now
+        service  iptables save
+    fi
+}
+
+function add_white_port_el7() {
+    port=$1
+    type=$2
+    systemctl status firewalld
+    ret=$?
+    echo $ret
+    if [ $ret != 0 ];then
+        echo "iptables not running,skipped"
+        return
+    fi
+     firewall-cmd --zone=public --query-port=$port/$type
+    if [ $? == 0 ];then
+        echo $port has be allowed,skipped
+        return
+    fi
+    firewall-cmd --zone=public --add-port=$port/$type --permanent
+    echo $?
+    if [ $? == 0 ];
+    then
+        echo $port is allowed now
+        firewall-cmd --reload
+    fi
+}
+
+function set_port() {
+    type=$1
+    if [ $type == "http" ];then
+        type=tcp
+    fi
+    port_str=${1}_port
+    p=`cat /home/s/safe/skylarproxy/conf/app.conf |grep $port_str|awk -F'=' '{print $2}'| awk '{print $1}'`
+    check_port $p $type
+}
+
+# port type
+##type: tcp udp
+function check_port(){
+port=$1
+type=$2
+
+#os=`uname -a|awk -F'.' '{print $5}'`
+os=`uname -r|grep el7`
+os_ret=$?
+if [ "$os_ret" == "0" ];then
+    add_white_port_el7 $port $type
+else
+    add_white_port_el6 $port $type
+fi
+
+}
+
+wait_for_pid () {
+        try=0
+        #先sleep1秒, 防止启动后马上又出错退出的情况
+        sleep 1
+        while test $try -lt 15 ; do
+
+                case "$1" in
+                        'created')
+                        if [ -f "$2" ] ; then
+                                return 0
+                        fi
+                        ;;
+
+                        'removed')
+                        if [ ! -f "$2" ] ; then
+                              return 0
+                        fi
+                        ;;
+                esac
+
+                echo -n .
+                try=`expr $try + 1`
+                sleep 1
+
+        done
+        return 1
+}
+
+case "$1" in
+        init)
+            chmod 644 $ROOT_DIR/sbin/*.cron
+            cp $ROOT_DIR/sbin/*.cron /etc/cron.d
+            systemctl start firewalld
+            set_port http
+            set_port udp
+            mkdir -p $PID_PATH
+            if [ -e $PID_PATH ]
+            then
+                echo init success
+            else
+                echo init error: mkdir $PID_PATH failed
+            fi
+        ;;
+        start)
+               status
+               num=`ps -ef|grep -v grep|grep -v srvctl|grep $APP|wc -l`
+               if [ $num -eq 0 ]
+               then
+                    rm -rf $PID
+               fi
+               echo "starting...."
+               if [ -s $PID ]
+               then
+                     #强制启动，会忽略pid文件的存在， 适合程序异常退出后的重启，或者机器重启的场景
+                     if [ "$2" = "-f" ]
+                     then
+                        echo "ignore existed pid file"
+                        rm -rf $PID
+                     else
+                        echo "pid file already exist"
+                        exit 1
+                     fi
+               fi
+               export GOGC=200 GOMAXPROCS=24
+               nohup $ROOT_DIR/sbin/$APP -f $ROOT_DIR/conf/app.conf -log_dir $ROOT_DIR/logs -stderrthreshold INFO  2>$ROOT_DIR/logs/run.log 1>$ROOT_DIR/logs/run.log &
+               wait_for_pid created $PID
+               if [ 0 != $? ]
+               then
+                        echo "failed, please refer to logs/run.log for more detail"
+                        exit 1
+               else
+                        echo "done"
+               fi
+        ;;
+
+        stop)
+                echo "stopping...."
+                if [  -f "$PID" ] ; then
+                    kill  `cat $PID`
+                fi
+                wait_for_pid removed $PID
+                if [ 0 != $? ]
+                then
+                    num=`ps -ef|grep -v grep|grep -v srvctl|grep $APP|wc -l`
+                    echo $num
+                    if [ $num -ne 0 ]
+                    then
+                        echo rm -rf $PID
+                        ps -ef|grep -v grep|grep -v srvctl|grep $APP|awk '{print $2}'|xargs kill -9
+                        rm -rf $PID
+                    fi
+                    echo "done"
+                    exit 1
+                else
+                    rm -rf $PID
+                    echo "done"
+                fi
+        ;;
+
+        restart)
+                /bin/bash $0 stop
+                echo "To start session in 2 seconds later..."
+               	/bin/bash $0 start
+                if [ $? != 0 ]
+                then
+                    echo "failed"
+                    exit 1
+                fi     
+        ;;
+
+        reload)
+                #todo热启动
+                echo "not supported yet...."
+                #kill -HUP `cat $ROOT_DIR/bin/pid`
+                echo "done"
+        ;;
+
+    status)
+        num=`ps -ef|grep -v grep|grep -v srvctl|grep $APP|wc -l`
+        if [ $num -eq 0 ]
+        then
+            echo $APP is not running
+            check_port_use http
+            check_port_use udp
+            rm -rf $PID
+            exit 1
+        else
+            echo $APP is running
+            exit 0
+        fi
+
+        ;;
+
+
+        *)
+            echo "Usage: $0 {start [-f]|stop|restart|init/status}"
+            exit 1
+
+        ;;
+esac
+
+exit 0
+

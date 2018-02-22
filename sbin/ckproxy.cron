@@ -1,0 +1,1 @@
+* * * * * root /bin/bash /home/s/safe/skylarproxy/sbin/check.sh> /dev/null 2>&1
